@@ -9,7 +9,7 @@ import (
 )
 
 var (
-	tooManyConnection = errors.New("too many open connection")
+	tooManyConnections = errors.New("too many open connection")
 )
 
 type pool struct {
@@ -67,6 +67,7 @@ func newPool(size int, ttl time.Duration, ms int, idle int) *pool {
 }
 
 func (p *pool) getConn(addr string, opts ...grpc.DialOption) (*poolConn, error) {
+	now := time.Now().Unix()
 	p.Lock()
 	sp, ok := p.conns[addr]
 	if !ok {
@@ -76,12 +77,12 @@ func (p *pool) getConn(addr string, opts ...grpc.DialOption) (*poolConn, error) 
 	// otherwise we'll create a new conn
 	conn := sp.head.next
 	for conn != nil {
-		// too many streams
-		if conn.streams >= p.maxStreams{
+		// too many streams or too old
+		if conn.streams >= p.maxStreams || now-conn.created > p.ttl {
 			conn = conn.next
 			continue
 		}
-		// a idle conn
+		// idle conn
 		if conn.streams == 0 {
 			sp.idle--
 		}
@@ -92,7 +93,7 @@ func (p *pool) getConn(addr string, opts ...grpc.DialOption) (*poolConn, error) 
 	}
 	// too many connection
 	if sp.count >= p.size {
-		return nil, tooManyConnection
+		return nil, tooManyConnections
 	}
 	p.Unlock()
 	// create new conn
@@ -117,7 +118,7 @@ func (p *pool) release(addr string, conn *poolConn, err error) {
 		return
 	}
 	// it has errored or
-	// too many idle conn or
+	// too many idle conns or
 	// conn is too old
 	now := time.Now().Unix()
 	p, sp, created := conn.pool, conn.sp, conn.created

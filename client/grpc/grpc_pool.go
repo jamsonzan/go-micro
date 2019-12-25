@@ -81,6 +81,10 @@ func (p *pool) getConn(addr string, opts ...grpc.DialOption) (*poolConn, error) 
 			conn = conn.next
 			continue
 		}
+		// a idle conn
+		if conn.streams == 0 {
+			sp.idle--
+		}
 		// we got a good conn, lets unlock and return it
 		conn.streams++
 		p.Unlock()

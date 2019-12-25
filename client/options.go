@@ -26,8 +26,8 @@ type Options struct {
 	Router Router
 
 	// Connection Pool
-	PoolSize int
-	PoolTTL  time.Duration
+	PoolSize   int
+	PoolTTL    time.Duration
 
 	// Middleware for client
 	Wrappers []Wrapper

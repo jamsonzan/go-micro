@@ -61,7 +61,7 @@ func newPool(size int, ttl time.Duration, ms int, idle int) *pool {
 		size:  size,
 		ttl:   int64(ttl.Seconds()),
 		maxStreams: ms,
-		maxIdle: 10,
+		maxIdle: idle,
 		conns: make(map[string]*streamsPool),
 	}
 }
@@ -155,4 +155,5 @@ func addConnAfter(conn *poolConn, after *poolConn)  {
 	}
 	after.next = conn
 	conn.sp.count++
+	return
 }

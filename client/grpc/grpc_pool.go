@@ -8,10 +8,6 @@ import (
 	"google.golang.org/grpc"
 )
 
-var (
-	tooManyConnections = errors.New("too many open connection")
-)
-
 type pool struct {
 	size int
 	ttl  int64
@@ -71,7 +67,8 @@ func (p *pool) getConn(addr string, opts ...grpc.DialOption) (*poolConn, error) 
 	p.Lock()
 	sp, ok := p.conns[addr]
 	if !ok {
-		p.conns[addr] = &streamsPool{head:&poolConn{}, count:0, idle:0}
+		sp = &streamsPool{head:&poolConn{}, count:0, idle:0}
+		p.conns[addr] = sp
 	}
 	// while we have conns check streams and then return one
 	// otherwise we'll create a new conn
@@ -82,7 +79,7 @@ func (p *pool) getConn(addr string, opts ...grpc.DialOption) (*poolConn, error) 
 			conn = conn.next
 			continue
 		}
-		// idle conn
+		// a idle conn
 		if conn.streams == 0 {
 			sp.idle--
 		}
@@ -91,20 +88,20 @@ func (p *pool) getConn(addr string, opts ...grpc.DialOption) (*poolConn, error) 
 		p.Unlock()
 		return conn, nil
 	}
-	// too many connection
-	if sp.count >= p.size {
-		return nil, tooManyConnections
-	}
 	p.Unlock()
+
 	// create new conn
 	cc, err := grpc.Dial(addr, opts...)
 	if err != nil {
 		return nil, err
 	}
 	conn = &poolConn{cc,nil,addr,p,sp,1,time.Now().Unix(), nil, nil}
+
 	// add conn to streams pool
 	p.Lock()
-	addConnAfter(conn, sp.head)
+	if sp.count < p.size {
+		addConnAfter(conn, sp.head)
+	}
 	p.Unlock()
 
 	return conn, nil
@@ -118,11 +115,12 @@ func (p *pool) release(addr string, conn *poolConn, err error) {
 		return
 	}
 	// it has errored or
-	// too many idle conns or
+	// too many idle conn or
+	// too many conn
 	// conn is too old
 	now := time.Now().Unix()
 	p, sp, created := conn.pool, conn.sp, conn.created
-	if err != nil || sp.idle >= p.maxIdle || now-created > p.ttl {
+	if err != nil || sp.idle >= p.maxIdle || sp.count >= p.size || now-created > p.ttl {
 		removeConn(conn)
 		p.Unlock()
 		conn.ClientConn.Close()

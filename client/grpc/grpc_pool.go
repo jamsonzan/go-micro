@@ -1,7 +1,6 @@
 package grpc
 
 import (
-	"errors"
 	"sync"
 	"time"
 

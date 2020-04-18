@@ -4,7 +4,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/micro/go-micro/metadata"
+	"github.com/micro/go-micro/v2/auth"
+	"github.com/micro/go-micro/v2/metadata"
 )
 
 func TestWrapper(t *testing.T) {
@@ -16,16 +17,16 @@ func TestWrapper(t *testing.T) {
 		{
 			existing: metadata.Metadata{},
 			headers: metadata.Metadata{
-				"foo": "bar",
+				"Foo": "bar",
 			},
 			overwrite: true,
 		},
 		{
 			existing: metadata.Metadata{
-				"foo": "bar",
+				"Foo": "bar",
 			},
 			headers: metadata.Metadata{
-				"foo": "baz",
+				"Foo": "baz",
 			},
 			overwrite: false,
 		},
@@ -33,6 +34,7 @@ func TestWrapper(t *testing.T) {
 
 	for _, d := range testData {
 		c := &clientWrapper{
+			auth:    func() auth.Auth { return nil },
 			headers: d.headers,
 		}
 

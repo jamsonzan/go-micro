@@ -2,21 +2,22 @@
 package certmagic
 
 import (
-	"log"
+	"crypto/tls"
 	"math/rand"
 	"net"
 	"time"
 
 	"github.com/mholt/certmagic"
-
-	"github.com/micro/go-micro/api/server/acme"
+	"github.com/micro/go-micro/v2/api/server/acme"
+	"github.com/micro/go-micro/v2/logger"
 )
 
 type certmagicProvider struct {
 	opts acme.Options
 }
 
-func (c *certmagicProvider) NewListener(ACMEHosts ...string) (net.Listener, error) {
+// TODO: set self-contained options
+func (c *certmagicProvider) setup() {
 	certmagic.Default.CA = c.opts.CA
 	if c.opts.ChallengeProvider != nil {
 		// Enabling DNS Challenge disables the other challenges
@@ -34,12 +35,20 @@ func (c *certmagicProvider) NewListener(ACMEHosts ...string) (net.Listener, erro
 	rand.Seed(time.Now().UnixNano())
 	randomDuration := (7 * 24 * time.Hour) + (time.Duration(rand.Intn(504)) * time.Hour)
 	certmagic.Default.RenewDurationBefore = randomDuration
-
-	return certmagic.Listen(ACMEHosts)
 }
 
-// New returns a certmagic provider
-func New(options ...acme.Option) acme.Provider {
+func (c *certmagicProvider) Listen(hosts ...string) (net.Listener, error) {
+	c.setup()
+	return certmagic.Listen(hosts)
+}
+
+func (c *certmagicProvider) TLSConfig(hosts ...string) (*tls.Config, error) {
+	c.setup()
+	return certmagic.TLS(hosts)
+}
+
+// NewProvider returns a certmagic provider
+func NewProvider(options ...acme.Option) acme.Provider {
 	opts := acme.DefaultOptions()
 
 	for _, o := range options {
@@ -48,7 +57,7 @@ func New(options ...acme.Option) acme.Provider {
 
 	if opts.Cache != nil {
 		if _, ok := opts.Cache.(certmagic.Storage); !ok {
-			log.Fatal("ACME: cache provided doesn't implement certmagic's Storage interface")
+			logger.Fatal("ACME: cache provided doesn't implement certmagic's Storage interface")
 		}
 	}
 

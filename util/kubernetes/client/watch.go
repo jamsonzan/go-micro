@@ -7,7 +7,7 @@ import (
 	"errors"
 	"net/http"
 
-	"github.com/micro/go-micro/util/kubernetes/api"
+	"github.com/micro/go-micro/v2/util/kubernetes/api"
 )
 
 const (
@@ -98,10 +98,12 @@ func newWatcher(req *api.Request) (Watcher, error) {
 	// do the raw request
 	res, err := req.Raw()
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		cancel()
 		// close the response body
 		res.Body.Close()
 		// return an error

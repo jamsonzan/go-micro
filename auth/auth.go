@@ -2,39 +2,132 @@
 package auth
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"time"
+
+	"github.com/micro/go-micro/v2/metadata"
+)
+
+var (
+	// ErrNotFound is returned when a resouce cannot be found
+	ErrNotFound = errors.New("not found")
+	// ErrEncodingToken is returned when the service encounters an error during encoding
+	ErrEncodingToken = errors.New("error encoding the token")
+	// ErrInvalidToken is returned when the token provided is not valid
+	ErrInvalidToken = errors.New("invalid token provided")
+	// ErrInvalidRole is returned when the role provided was invalid
+	ErrInvalidRole = errors.New("invalid role")
+	// ErrForbidden is returned when a user does not have the necessary roles to access a resource
+	ErrForbidden = errors.New("resource forbidden")
 )
 
 // Auth providers authentication and authorization
 type Auth interface {
-	// Generate a new auth token
-	Generate(string) (*Token, error)
-	// Revoke an authorization token
-	Revoke(*Token) error
+	// Init the auth
+	Init(opts ...Option)
+	// Options set for auth
+	Options() Options
+	// Generate a new account
+	Generate(id string, opts ...GenerateOption) (*Account, error)
 	// Grant access to a resource
-	Grant(*Token, *Service) error
-	// Verify a token can access a resource
-	Verify(*Token, *Service) error
+	Grant(role string, res *Resource) error
+	// Revoke access to a resource
+	Revoke(role string, res *Resource) error
+	// Verify an account has access to a resource
+	Verify(acc *Account, res *Resource) error
+	// Inspect a token
+	Inspect(token string) (*Account, error)
+	// Token generated using refresh token
+	Token(opts ...TokenOption) (*Token, error)
+	// String returns the name of the implementation
+	String() string
 }
 
-// Service is some thing to provide access to
-type Service struct {
+// Resource is an entity such as a user or
+type Resource struct {
 	// Name of the resource
-	Name string
-	// Endpoint is the specific endpoint
-	Endpoint string
+	Name string `json:"name"`
+	// Type of resource, e.g.
+	Type string `json:"type"`
+	// Endpoint resource e.g NotesService.Create
+	Endpoint string `json:"endpoint"`
+	// Namespace the resource belongs to
+	Namespace string `json:"namespace"`
 }
 
-// Token providers by an auth provider
+// Account provided by an auth provider
+type Account struct {
+	// ID of the account e.g. email
+	ID string `json:"id"`
+	// Type of the account, e.g. service
+	Type string `json:"type"`
+	// Provider who issued the account
+	Provider string `json:"provider"`
+	// Roles associated with the Account
+	Roles []string `json:"roles"`
+	// Any other associated metadata
+	Metadata map[string]string `json:"metadata"`
+	// Namespace the account belongs to
+	Namespace string `json:"namespace"`
+	// Secret for the account, e.g. the password
+	Secret string `json:"secret"`
+}
+
+// Token can be short or long lived
 type Token struct {
-	// Unique token id
-	Id string `json: "id"`
+	// The token to be used for accessing resources
+	AccessToken string `json:"access_token"`
+	// RefreshToken to be used to generate a new token
+	RefreshToken string `json:"refresh_token"`
 	// Time of token creation
 	Created time.Time `json:"created"`
 	// Time of token expiry
 	Expiry time.Time `json:"expiry"`
-	// Roles associated with the token
-	Roles []string `json:"roles"`
-	// Any other associated metadata
-	Metadata map[string]string `json:"metadata"`
+}
+
+const (
+	// DefaultNamespace used for auth
+	DefaultNamespace = "go.micro"
+	// MetadataKey is the key used when storing the account in metadata
+	MetadataKey = "auth-account"
+	// TokenCookieName is the name of the cookie which stores the auth token
+	TokenCookieName = "micro-token"
+	// SecretCookieName is the name of the cookie which stores the auth secret
+	SecretCookieName = "micro-secret"
+	// BearerScheme used for Authorization header
+	BearerScheme = "Bearer "
+)
+
+// AccountFromContext gets the account from the context, which
+// is set by the auth wrapper at the start of a call. If the account
+// is not set, a nil account will be returned. The error is only returned
+// when there was a problem retrieving an account
+func AccountFromContext(ctx context.Context) (*Account, error) {
+	str, ok := metadata.Get(ctx, MetadataKey)
+	// there was no account set
+	if !ok {
+		return nil, nil
+	}
+
+	var acc *Account
+	// metadata is stored as a string, so unmarshal to an account
+	if err := json.Unmarshal([]byte(str), &acc); err != nil {
+		return nil, err
+	}
+
+	return acc, nil
+}
+
+// ContextWithAccount sets the account in the context
+func ContextWithAccount(ctx context.Context, account *Account) (context.Context, error) {
+	// metadata is stored as a string, so marshal to bytes
+	bytes, err := json.Marshal(account)
+	if err != nil {
+		return ctx, err
+	}
+
+	// generate a new context with the MetadataKey set
+	return metadata.Set(ctx, MetadataKey, string(bytes)), nil
 }

@@ -3,8 +3,11 @@ package client
 var templates = map[string]string{
 	"deployment": deploymentTmpl,
 	"service":    serviceTmpl,
+	"namespace":  namespaceTmpl,
 }
 
+// stripped image pull policy always
+// imagePullPolicy: Always
 var deploymentTmpl = `
 apiVersion: apps/v1
 kind: Deployment
@@ -58,12 +61,15 @@ spec:
             value: "{{ .Value }}"
           {{- end }}
           {{- end }}
+          args:
+          {{- range .Args }}
+          - {{.}}
+          {{- end }}
           command:
           {{- range .Command }}
           - {{.}}
           {{- end }}
           image: {{ .Image }}
-          imagePullPolicy: Always
           ports:
           {{- with .Ports }}
           {{- range . }}
@@ -102,4 +108,17 @@ spec:
     protocol: {{ .Protocol }}
   {{- end }}
   {{- end }}
+`
+
+var namespaceTmpl = `
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: "{{ .Metadata.Name }}"
+  labels:
+    {{- with .Metadata.Labels }}
+    {{- range $key, $value := . }}
+    {{ $key }}: "{{ $value }}"
+    {{- end }}
+    {{- end }}
 `

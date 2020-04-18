@@ -5,7 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 
-	"github.com/micro/go-micro/client"
+	"github.com/micro/go-micro/v2/client"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/encoding"
 )
@@ -28,8 +28,8 @@ var (
 	DefaultMaxSendMsgSize = 1024 * 1024 * 4
 )
 
-type poolMaxStreams struct {}
-type poolMaxIdle struct {}
+type poolMaxStreams struct{}
+type poolMaxIdle struct{}
 type codecsKey struct{}
 type tlsAuth struct{}
 type maxRecvMsgSizeKey struct{}
@@ -129,4 +129,3 @@ func CallOptions(opts ...grpc.CallOption) client.CallOption {
 		o.Context = context.WithValue(o.Context, grpcCallOptions{}, opts)
 	}
 }
-

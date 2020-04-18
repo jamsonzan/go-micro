@@ -5,16 +5,17 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 )
 
 type pool struct {
 	size int
 	ttl  int64
-	
+
 	//  max streams on a *poolConn
 	maxStreams int
 	//  max idle conns
-	maxIdle    int
+	maxIdle int
 
 	sync.Mutex
 	conns map[string]*streamsPool
@@ -22,20 +23,20 @@ type pool struct {
 
 type streamsPool struct {
 	//  head of list
-	head   *poolConn
+	head *poolConn
 	//  busy conns list
-	busy   *poolConn
+	busy *poolConn
 	//  the siza of list
-	count  int
+	count int
 	//  idle conn
-	idle   int
+	idle int
 }
 
 type poolConn struct {
 	//  grpc conn
 	*grpc.ClientConn
-	err     error
-	addr    string
+	err  error
+	addr string
 
 	//  pool and streams pool
 	pool    *pool
@@ -44,9 +45,9 @@ type poolConn struct {
 	created int64
 
 	//  list
-	pre     *poolConn
-	next    *poolConn
-	in      bool
+	pre  *poolConn
+	next *poolConn
+	in   bool
 }
 
 func newPool(size int, ttl time.Duration, idle int, ms int) *pool {
@@ -57,11 +58,11 @@ func newPool(size int, ttl time.Duration, idle int, ms int) *pool {
 		idle = 0
 	}
 	return &pool{
-		size:  size,
-		ttl:   int64(ttl.Seconds()),
+		size:       size,
+		ttl:        int64(ttl.Seconds()),
 		maxStreams: ms,
-		maxIdle: idle,
-		conns: make(map[string]*streamsPool),
+		maxIdle:    idle,
+		conns:      make(map[string]*streamsPool),
 	}
 }
 
@@ -70,13 +71,39 @@ func (p *pool) getConn(addr string, opts ...grpc.DialOption) (*poolConn, error) 
 	p.Lock()
 	sp, ok := p.conns[addr]
 	if !ok {
-		sp = &streamsPool{head:&poolConn{}, busy:&poolConn{}, count:0, idle:0}
+		sp = &streamsPool{head: &poolConn{}, busy: &poolConn{}, count: 0, idle: 0}
 		p.conns[addr] = sp
 	}
 	//  while we have conns check streams and then return one
 	//  otherwise we'll create a new conn
 	conn := sp.head.next
 	for conn != nil {
+		//  check conn state
+		// https://github.com/grpc/grpc/blob/master/doc/connectivity-semantics-and-api.md
+		switch conn.GetState() {
+		case connectivity.Connecting:
+			conn = conn.next
+			continue
+		case connectivity.Shutdown:
+			next := conn.next
+			if conn.streams == 0 {
+				removeConn(conn)
+				sp.idle--
+			}
+			conn = next
+			continue
+		case connectivity.TransientFailure:
+			next := conn.next
+			if conn.streams == 0 {
+				removeConn(conn)
+				conn.ClientConn.Close()
+				sp.idle--
+			}
+			conn = next
+			continue
+		case connectivity.Ready:
+		case connectivity.Idle:
+		}
 		//  a old conn
 		if now-conn.created > p.ttl {
 			next := conn.next
@@ -90,11 +117,11 @@ func (p *pool) getConn(addr string, opts ...grpc.DialOption) (*poolConn, error) 
 		}
 		//  a busy conn
 		if conn.streams >= p.maxStreams {
-				next := conn.next
-				removeConn(conn)
-				addConnAfter(conn, sp.busy)
-				conn = next
-	           	continue
+			next := conn.next
+			removeConn(conn)
+			addConnAfter(conn, sp.busy)
+			conn = next
+			continue
 		}
 		//  a idle conn
 		if conn.streams == 0 {
@@ -112,7 +139,7 @@ func (p *pool) getConn(addr string, opts ...grpc.DialOption) (*poolConn, error) 
 	if err != nil {
 		return nil, err
 	}
-	conn = &poolConn{cc,nil,addr,p,sp,1,time.Now().Unix(), nil, nil, false}
+	conn = &poolConn{cc, nil, addr, p, sp, 1, time.Now().Unix(), nil, nil, false}
 
 	//  add conn to streams pool
 	p.Lock()
@@ -148,7 +175,7 @@ func (p *pool) release(addr string, conn *poolConn, err error) {
 		//  2. too many idle conn or
 		//  3. conn is too old
 		now := time.Now().Unix()
-		if  err != nil || sp.idle >= p.maxIdle || now-created > p.ttl {
+		if err != nil || sp.idle >= p.maxIdle || now-created > p.ttl {
 			removeConn(conn)
 			p.Unlock()
 			conn.ClientConn.Close()
@@ -160,11 +187,11 @@ func (p *pool) release(addr string, conn *poolConn, err error) {
 	return
 }
 
-func (conn *poolConn)Close()  {
+func (conn *poolConn) Close() {
 	conn.pool.release(conn.addr, conn, conn.err)
 }
 
-func removeConn(conn *poolConn)  {
+func removeConn(conn *poolConn) {
 	if conn.pre != nil {
 		conn.pre.next = conn.next
 	}
@@ -178,7 +205,7 @@ func removeConn(conn *poolConn)  {
 	return
 }
 
-func addConnAfter(conn *poolConn, after *poolConn)  {
+func addConnAfter(conn *poolConn, after *poolConn) {
 	conn.next = after.next
 	conn.pre = after
 	if after.next != nil {

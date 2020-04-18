@@ -12,16 +12,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/micro/go-micro/broker"
-	"github.com/micro/go-micro/codec"
-	raw "github.com/micro/go-micro/codec/bytes"
-	"github.com/micro/go-micro/metadata"
-	"github.com/micro/go-micro/registry"
-	"github.com/micro/go-micro/transport"
-	"github.com/micro/go-micro/util/addr"
-	log "github.com/micro/go-micro/util/log"
-	mnet "github.com/micro/go-micro/util/net"
-	"github.com/micro/go-micro/util/socket"
+	"github.com/micro/go-micro/v2/broker"
+	"github.com/micro/go-micro/v2/codec"
+	raw "github.com/micro/go-micro/v2/codec/bytes"
+	"github.com/micro/go-micro/v2/logger"
+	"github.com/micro/go-micro/v2/metadata"
+	"github.com/micro/go-micro/v2/registry"
+	"github.com/micro/go-micro/v2/transport"
+	"github.com/micro/go-micro/v2/util/addr"
+	mnet "github.com/micro/go-micro/v2/util/net"
+	"github.com/micro/go-micro/v2/util/socket"
 )
 
 type rpcServer struct {
@@ -40,6 +40,8 @@ type rpcServer struct {
 	subscriber broker.Subscriber
 	// graceful exit
 	wg *sync.WaitGroup
+
+	rsvc *registry.Service
 }
 
 func newRpcServer(opts ...Option) Server {
@@ -85,7 +87,7 @@ func (s *rpcServer) HandleEvent(e broker.Event) error {
 	}
 
 	// copy headers
-	hdr := make(map[string]string)
+	hdr := make(map[string]string, len(msg.Header))
 	for k, v := range msg.Header {
 		hdr[k] = v
 	}
@@ -158,8 +160,10 @@ func (s *rpcServer) ServeConn(sock transport.Socket) {
 
 		// recover any panics
 		if r := recover(); r != nil {
-			log.Log("panic recovered: ", r)
-			log.Log(string(debug.Stack()))
+			if logger.V(logger.ErrorLevel, log) {
+				log.Error("panic recovered: ", r)
+				log.Error(string(debug.Stack()))
+			}
 		}
 	}()
 
@@ -262,7 +266,7 @@ func (s *rpcServer) ServeConn(sock transport.Socket) {
 		ct := msg.Header["Content-Type"]
 
 		// copy the message headers
-		hdr := make(map[string]string)
+		hdr := make(map[string]string, len(msg.Header))
 		for k, v := range msg.Header {
 			hdr[k] = v
 		}
@@ -377,8 +381,10 @@ func (s *rpcServer) ServeConn(sock transport.Socket) {
 
 				// recover any panics for outbound process
 				if r := recover(); r != nil {
-					log.Log("panic recovered: ", r)
-					log.Log(string(debug.Stack()))
+					if logger.V(logger.ErrorLevel, log) {
+						log.Error("panic recovered: ", r)
+						log.Error(string(debug.Stack()))
+					}
 				}
 			}()
 
@@ -409,8 +415,8 @@ func (s *rpcServer) ServeConn(sock transport.Socket) {
 
 				// recover any panics for call handler
 				if r := recover(); r != nil {
-					log.Log("panic recovered: ", r)
-					log.Log(string(debug.Stack()))
+					log.Error("panic recovered: ", r)
+					log.Error(string(debug.Stack()))
 				}
 			}()
 
@@ -455,10 +461,11 @@ func (s *rpcServer) Options() Options {
 
 func (s *rpcServer) Init(opts ...Option) error {
 	s.Lock()
+	defer s.Unlock()
+
 	for _, opt := range opts {
 		opt(&s.opts)
 	}
-
 	// update router if its the default
 	if s.opts.Router == nil {
 		r := newRpcRouter()
@@ -468,7 +475,8 @@ func (s *rpcServer) Init(opts ...Option) error {
 		s.router = r
 	}
 
-	s.Unlock()
+	s.rsvc = nil
+
 	return nil
 }
 
@@ -506,11 +514,24 @@ func (s *rpcServer) Subscribe(sb Subscriber) error {
 }
 
 func (s *rpcServer) Register() error {
+
+	s.RLock()
+	rsvc := s.rsvc
+	config := s.Options()
+	s.RUnlock()
+
+	if rsvc != nil {
+		rOpts := []registry.RegisterOption{registry.RegisterTTL(config.RegisterTTL)}
+		if err := config.Registry.Register(rsvc, rOpts...); err != nil {
+			return err
+		}
+
+		return nil
+	}
+
 	var err error
 	var advt, host, port string
-
-	// parse address for host, port
-	config := s.Options()
+	var cacheService bool
 
 	// check the advertise address first
 	// if it exists then use it, otherwise
@@ -531,16 +552,17 @@ func (s *rpcServer) Register() error {
 		host = advt
 	}
 
+	if ip := net.ParseIP(host); ip != nil {
+		cacheService = true
+	}
+
 	addr, err := addr.Extract(host)
 	if err != nil {
 		return err
 	}
 
 	// make copy of metadata
-	md := make(metadata.Metadata)
-	for k, v := range config.Metadata {
-		md[k] = v
-	}
+	md := metadata.Copy(config.Metadata)
 
 	// mq-rpc(eg. nats) doesn't need the port. its addr is queue name.
 	if port != "" {
@@ -608,7 +630,9 @@ func (s *rpcServer) Register() error {
 	s.RUnlock()
 
 	if !registered {
-		log.Logf("Registry [%s] Registering node: %s", config.Registry.String(), node.Id)
+		if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+			log.Debugf("Registry [%s] Registering node: %s", config.Registry.String(), node.Id)
+		}
 	}
 
 	// create registry options
@@ -626,18 +650,24 @@ func (s *rpcServer) Register() error {
 	s.Lock()
 	defer s.Unlock()
 
+	if cacheService {
+		s.rsvc = service
+	}
 	s.registered = true
 	// set what we're advertising
 	s.opts.Advertise = addr
 
-	// subscribe to the topic with own name
-	sub, err := s.opts.Broker.Subscribe(config.Name, s.HandleEvent)
-	if err != nil {
-		return err
-	}
+	// router can exchange messages
+	if s.opts.Router != nil {
+		// subscribe to the topic with own name
+		sub, err := s.opts.Broker.Subscribe(config.Name, s.HandleEvent)
+		if err != nil {
+			return err
+		}
 
-	// save the subscriber
-	s.subscriber = sub
+		// save the subscriber
+		s.subscriber = sub
+	}
 
 	// subscribe for all of the subscribers
 	for sb := range s.subscribers {
@@ -658,8 +688,9 @@ func (s *rpcServer) Register() error {
 		if err != nil {
 			return err
 		}
-
-		log.Logf("Subscribing %s to topic: %s", node.Id, sub.Topic())
+		if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+			log.Debugf("Subscribing to topic: %s", sub.Topic())
+		}
 		s.subscribers[sb] = []broker.Subscriber{sub}
 	}
 
@@ -670,7 +701,9 @@ func (s *rpcServer) Deregister() error {
 	var err error
 	var advt, host, port string
 
+	s.RLock()
 	config := s.Options()
+	s.RUnlock()
 
 	// check the advertise address first
 	// if it exists then use it, otherwise
@@ -712,12 +745,15 @@ func (s *rpcServer) Deregister() error {
 		Nodes:   []*registry.Node{node},
 	}
 
-	log.Logf("Registry [%s] Deregistering node: %s", config.Registry.String(), node.Id)
+	if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+		log.Debugf("Registry [%s] Deregistering node: %s", config.Registry.String(), node.Id)
+	}
 	if err := config.Registry.Deregister(service); err != nil {
 		return err
 	}
 
 	s.Lock()
+	s.rsvc = nil
 
 	if !s.registered {
 		s.Unlock()
@@ -734,7 +770,9 @@ func (s *rpcServer) Deregister() error {
 
 	for sb, subs := range s.subscribers {
 		for _, sub := range subs {
-			log.Logf("Unsubscribing %s from topic: %s", node.Id, sub.Topic())
+			if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+				log.Debugf("Unsubscribing %s from topic: %s", node.Id, sub.Topic())
+			}
 			sub.Unsubscribe()
 		}
 		s.subscribers[sb] = nil
@@ -760,7 +798,9 @@ func (s *rpcServer) Start() error {
 		return err
 	}
 
-	log.Logf("Transport [%s] Listening on %s", config.Transport.String(), ts.Addr())
+	if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+		log.Debugf("Transport [%s] Listening on %s", config.Transport.String(), ts.Addr())
+	}
 
 	// swap address
 	s.Lock()
@@ -768,22 +808,31 @@ func (s *rpcServer) Start() error {
 	s.opts.Address = ts.Addr()
 	s.Unlock()
 
+	bname := config.Broker.String()
+
 	// connect to the broker
 	if err := config.Broker.Connect(); err != nil {
+		if logger.V(logger.ErrorLevel, logger.DefaultLogger) {
+			log.Errorf("Broker [%s] connect error: %v", bname, err)
+		}
 		return err
 	}
 
-	bname := config.Broker.String()
-
-	log.Logf("Broker [%s] Connected to %s", bname, config.Broker.Address())
+	if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+		log.Debugf("Broker [%s] Connected to %s", bname, config.Broker.Address())
+	}
 
 	// use RegisterCheck func before register
 	if err = s.opts.RegisterCheck(s.opts.Context); err != nil {
-		log.Logf("Server %s-%s register check error: %s", config.Name, config.Id, err)
+		if logger.V(logger.ErrorLevel, logger.DefaultLogger) {
+			log.Errorf("Server %s-%s register check error: %s", config.Name, config.Id, err)
+		}
 	} else {
 		// announce self to the world
 		if err = s.Register(); err != nil {
-			log.Logf("Server %s-%s register error: %s", config.Name, config.Id, err)
+			if logger.V(logger.ErrorLevel, logger.DefaultLogger) {
+				log.Errorf("Server %s-%s register error: %s", config.Name, config.Id, err)
+			}
 		}
 	}
 
@@ -804,7 +853,9 @@ func (s *rpcServer) Start() error {
 			// check the error and backoff
 			default:
 				if err != nil {
-					log.Logf("Accept error: %v", err)
+					if logger.V(logger.ErrorLevel, logger.DefaultLogger) {
+						log.Errorf("Accept error: %v", err)
+					}
 					time.Sleep(time.Second)
 					continue
 				}
@@ -837,17 +888,25 @@ func (s *rpcServer) Start() error {
 				s.RUnlock()
 				rerr := s.opts.RegisterCheck(s.opts.Context)
 				if rerr != nil && registered {
-					log.Logf("Server %s-%s register check error: %s, deregister it", config.Name, config.Id, err)
+					if logger.V(logger.ErrorLevel, logger.DefaultLogger) {
+						log.Errorf("Server %s-%s register check error: %s, deregister it", config.Name, config.Id, err)
+					}
 					// deregister self in case of error
 					if err := s.Deregister(); err != nil {
-						log.Logf("Server %s-%s deregister error: %s", config.Name, config.Id, err)
+						if logger.V(logger.ErrorLevel, logger.DefaultLogger) {
+							log.Errorf("Server %s-%s deregister error: %s", config.Name, config.Id, err)
+						}
 					}
 				} else if rerr != nil && !registered {
-					log.Logf("Server %s-%s register check error: %s", config.Name, config.Id, err)
+					if logger.V(logger.ErrorLevel, logger.DefaultLogger) {
+						log.Errorf("Server %s-%s register check error: %s", config.Name, config.Id, err)
+					}
 					continue
 				}
 				if err := s.Register(); err != nil {
-					log.Logf("Server %s-%s register error: %s", config.Name, config.Id, err)
+					if logger.V(logger.ErrorLevel, logger.DefaultLogger) {
+						log.Errorf("Server %s-%s register error: %s", config.Name, config.Id, err)
+					}
 				}
 			// wait for exit
 			case ch = <-s.exit:
@@ -863,7 +922,9 @@ func (s *rpcServer) Start() error {
 		if registered {
 			// deregister self
 			if err := s.Deregister(); err != nil {
-				log.Logf("Server %s-%s deregister error: %s", config.Name, config.Id, err)
+				if logger.V(logger.ErrorLevel, logger.DefaultLogger) {
+					log.Errorf("Server %s-%s deregister error: %s", config.Name, config.Id, err)
+				}
 			}
 		}
 
@@ -879,8 +940,15 @@ func (s *rpcServer) Start() error {
 		// close transport listener
 		ch <- ts.Close()
 
+		if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+			log.Debugf("Broker [%s] Disconnected from %s", bname, config.Broker.Address())
+		}
 		// disconnect the broker
-		config.Broker.Disconnect()
+		if err := config.Broker.Disconnect(); err != nil {
+			if logger.V(logger.ErrorLevel, logger.DefaultLogger) {
+				log.Errorf("Broker [%s] Disconnect error: %v", bname, err)
+			}
+		}
 
 		// swap back address
 		s.Lock()

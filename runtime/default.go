@@ -2,10 +2,17 @@ package runtime
 
 import (
 	"errors"
+	"fmt"
+	"io"
+	"log"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/micro/go-micro/util/log"
+	"github.com/hpcloud/tail"
+	"github.com/micro/go-micro/v2/logger"
 )
 
 type runtime struct {
@@ -32,6 +39,10 @@ func NewRuntime(opts ...Option) Runtime {
 	for _, o := range opts {
 		o(&options)
 	}
+
+	// make the logs directory
+	path := filepath.Join(os.TempDir(), "micro", "logs")
+	_ = os.MkdirAll(path, 0755)
 
 	return &runtime{
 		options:  options,
@@ -71,7 +82,9 @@ func (r *runtime) run(events <-chan Event) {
 			return nil
 		}
 
-		log.Debugf("Runtime updating service %s", name)
+		if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+			logger.Debugf("Runtime updating service %s", name)
+		}
 
 		// this will cause a delete followed by created
 		if err := r.Update(service.Service); err != nil {
@@ -92,28 +105,38 @@ func (r *runtime) run(events <-chan Event) {
 			// check running services
 			r.RLock()
 			for _, service := range r.services {
-				if service.Running() {
+				if !service.ShouldStart() {
 					continue
 				}
 
 				// TODO: check service error
-				log.Debugf("Runtime starting %s", service.Name)
+				if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+					logger.Debugf("Runtime starting %s", service.Name)
+				}
 				if err := service.Start(); err != nil {
-					log.Debugf("Runtime error starting %s: %v", service.Name, err)
+					if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+						logger.Debugf("Runtime error starting %s: %v", service.Name, err)
+					}
 				}
 			}
 			r.RUnlock()
 		case service := <-r.start:
-			if service.Running() {
+			if !service.ShouldStart() {
 				continue
 			}
 			// TODO: check service error
-			log.Debugf("Runtime starting service %s", service.Name)
+			if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+				logger.Debugf("Runtime starting service %s", service.Name)
+			}
 			if err := service.Start(); err != nil {
-				log.Debugf("Runtime error starting service %s: %v", service.Name, err)
+				if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+					logger.Debugf("Runtime error starting service %s: %v", service.Name, err)
+				}
 			}
 		case event := <-events:
-			log.Debugf("Runtime received notification event: %v", event)
+			if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+				logger.Debugf("Runtime received notification event: %v", event)
+			}
 			// NOTE: we only handle Update events for now
 			switch event.Type {
 			case Update:
@@ -122,11 +145,15 @@ func (r *runtime) run(events <-chan Event) {
 					service, ok := r.services[event.Service]
 					r.RUnlock()
 					if !ok {
-						log.Debugf("Runtime unknown service: %s", event.Service)
+						if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+							logger.Debugf("Runtime unknown service: %s", event.Service)
+						}
 						continue
 					}
 					if err := processEvent(event, service); err != nil {
-						log.Debugf("Runtime error updating service %s: %v", event.Service, err)
+						if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+							logger.Debugf("Runtime error updating service %s: %v", event.Service, err)
+						}
 					}
 					continue
 				}
@@ -138,15 +165,26 @@ func (r *runtime) run(events <-chan Event) {
 				// if blank service was received we update all services
 				for _, service := range services {
 					if err := processEvent(event, service); err != nil {
-						log.Debugf("Runtime error updating service %s: %v", service.Name, err)
+						if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+							logger.Debugf("Runtime error updating service %s: %v", service.Name, err)
+						}
 					}
 				}
 			}
 		case <-r.closed:
-			log.Debugf("Runtime stopped")
+			if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+				logger.Debugf("Runtime stopped")
+			}
 			return
 		}
 	}
+}
+
+func logFile(serviceName string) string {
+	// make the directory
+	name := strings.Replace(serviceName, "/", "-", -1)
+	path := filepath.Join(os.TempDir(), "micro", "logs")
+	return filepath.Join(path, fmt.Sprintf("%v.log", name))
 }
 
 // Create creates a new service which is then started by runtime
@@ -155,7 +193,7 @@ func (r *runtime) Create(s *Service, opts ...CreateOption) error {
 	defer r.Unlock()
 
 	if _, ok := r.services[s.Name]; ok {
-		return errors.New("service already registered")
+		return errors.New("service already running")
 	}
 
 	var options CreateOptions
@@ -164,12 +202,23 @@ func (r *runtime) Create(s *Service, opts ...CreateOption) error {
 	}
 
 	if len(options.Command) == 0 {
-		return errors.New("missing exec command")
+		options.Command = []string{"go"}
+		options.Args = []string{"run", "."}
 	}
 
 	// create new service
 	service := newService(s, options)
 
+	f, err := os.OpenFile(logFile(service.Name), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if service.output != nil {
+		service.output = io.MultiWriter(service.output, f)
+	} else {
+		service.output = f
+	}
 	// start the service
 	if err := service.Start(); err != nil {
 		return err
@@ -178,6 +227,70 @@ func (r *runtime) Create(s *Service, opts ...CreateOption) error {
 	// save service
 	r.services[s.Name] = service
 
+	return nil
+}
+
+// @todo: Getting existing lines is not supported yet.
+// The reason for this is because it's hard to calculate line offset
+// as opposed to character offset.
+// This logger streams by default and only supports the `StreamCount` option.
+func (r *runtime) Logs(s *Service, options ...LogsOption) (LogStream, error) {
+	lopts := LogsOptions{}
+	for _, o := range options {
+		o(&lopts)
+	}
+	ret := &logStream{
+		service: s.Name,
+		stream:  make(chan LogRecord),
+		stop:    make(chan bool),
+	}
+	t, err := tail.TailFile(logFile(s.Name), tail.Config{Follow: true, Location: &tail.SeekInfo{
+		Whence: 2,
+		Offset: 0,
+	}, Logger: tail.DiscardingLogger})
+	if err != nil {
+		return nil, err
+	}
+	ret.tail = t
+	go func() {
+		for line := range t.Lines {
+			ret.stream <- LogRecord{Message: line.Text}
+		}
+	}()
+	return ret, nil
+}
+
+type logStream struct {
+	tail    *tail.Tail
+	service string
+	stream  chan LogRecord
+	sync.Mutex
+	stop chan bool
+	err  error
+}
+
+func (l *logStream) Chan() chan LogRecord {
+	return l.stream
+}
+
+func (l *logStream) Error() error {
+	return l.err
+}
+
+func (l *logStream) Stop() error {
+	l.Lock()
+	defer l.Unlock()
+	// @todo seems like this is causing a hangup
+	//err := l.tail.Stop()
+	//if err != nil {
+	//	return err
+	//}
+	select {
+	case <-l.stop:
+		return nil
+	default:
+		close(l.stop)
+	}
 	return nil
 }
 
@@ -219,22 +332,17 @@ func (r *runtime) Read(opts ...ReadOption) ([]*Service, error) {
 
 // Update attemps to update the service
 func (r *runtime) Update(s *Service) error {
-	var opts []CreateOption
-
-	// check if the service already exists
-	r.RLock()
-	if service, ok := r.services[s.Name]; ok {
-		opts = append(opts, WithOutput(service.output))
+	r.Lock()
+	service, ok := r.services[s.Name]
+	r.Unlock()
+	if !ok {
+		return errors.New("Service not found")
 	}
-	r.RUnlock()
-
-	// delete the service
-	if err := r.Delete(s); err != nil {
+	err := service.Stop()
+	if err != nil {
 		return err
 	}
-
-	// create new service
-	return r.Create(s, opts...)
+	return service.Start()
 }
 
 // Delete removes the service from the runtime and stops it
@@ -242,10 +350,12 @@ func (r *runtime) Delete(s *Service) error {
 	r.Lock()
 	defer r.Unlock()
 
-	log.Debugf("Runtime deleting service %s", s.Name)
+	if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+		logger.Debugf("Runtime deleting service %s", s.Name)
+	}
 	if s, ok := r.services[s.Name]; ok {
 		// check if running
-		if !s.Running() {
+		if s.Running() {
 			delete(r.services, s.Name)
 			return nil
 		}
@@ -290,12 +400,14 @@ func (r *runtime) Start() error {
 	r.closed = make(chan bool)
 
 	var events <-chan Event
-	if r.options.Notifier != nil {
+	if r.options.Scheduler != nil {
 		var err error
-		events, err = r.options.Notifier.Notify()
+		events, err = r.options.Scheduler.Notify()
 		if err != nil {
 			// TODO: should we bail here?
-			log.Debugf("Runtime failed to start update notifier")
+			if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+				logger.Debugf("Runtime failed to start update notifier")
+			}
 		}
 	}
 
@@ -324,12 +436,14 @@ func (r *runtime) Stop() error {
 
 		// stop all the services
 		for _, service := range r.services {
-			log.Debugf("Runtime stopping %s", service.Name)
+			if logger.V(logger.DebugLevel, logger.DefaultLogger) {
+				logger.Debugf("Runtime stopping %s", service.Name)
+			}
 			service.Stop()
 		}
-		// stop the notifier too
-		if r.options.Notifier != nil {
-			return r.options.Notifier.Close()
+		// stop the scheduler
+		if r.options.Scheduler != nil {
+			return r.options.Scheduler.Close()
 		}
 	}
 

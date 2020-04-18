@@ -4,34 +4,16 @@ import (
 	"context"
 	"sync"
 
-	"github.com/micro/go-micro/client"
-	"github.com/micro/go-micro/runtime"
-	pb "github.com/micro/go-micro/runtime/service/proto"
+	"github.com/micro/go-micro/v2/client"
+	"github.com/micro/go-micro/v2/runtime"
+	pb "github.com/micro/go-micro/v2/runtime/service/proto"
+	"github.com/micro/go-micro/v2/util/log"
 )
 
 type svc struct {
 	sync.RWMutex
 	options runtime.Options
 	runtime pb.RuntimeService
-}
-
-// NewRuntime creates new service runtime and returns it
-func NewRuntime(opts ...runtime.Option) runtime.Runtime {
-	// get default options
-	options := runtime.Options{}
-
-	// apply requested options
-	for _, o := range opts {
-		o(&options)
-	}
-
-	// create default client
-	cli := client.DefaultClient
-
-	return &svc{
-		options: options,
-		runtime: pb.NewRuntimeService(runtime.DefaultName, cli),
-	}
 }
 
 // Init initializes runtime with given options
@@ -54,6 +36,11 @@ func (s *svc) Create(svc *runtime.Service, opts ...runtime.CreateOption) error {
 		o(&options)
 	}
 
+	// set the default source from MICRO_RUNTIME_SOURCE
+	if len(svc.Source) == 0 {
+		svc.Source = s.options.Source
+	}
+
 	// runtime service create request
 	req := &pb.CreateRequest{
 		Service: &pb.Service{
@@ -64,7 +51,10 @@ func (s *svc) Create(svc *runtime.Service, opts ...runtime.CreateOption) error {
 		},
 		Options: &pb.CreateOptions{
 			Command: options.Command,
+			Args:    options.Args,
 			Env:     options.Env,
+			Type:    options.Type,
+			Image:   options.Image,
 		},
 	}
 
@@ -72,6 +62,61 @@ func (s *svc) Create(svc *runtime.Service, opts ...runtime.CreateOption) error {
 		return err
 	}
 
+	return nil
+}
+
+func (s *svc) Logs(service *runtime.Service, options ...runtime.LogsOption) (runtime.LogStream, error) {
+	ls, err := s.runtime.Logs(context.Background(), &pb.LogsRequest{
+		Service: service.Name,
+		Stream:  true,
+		Count:   10, // @todo pass in actual options
+	})
+	if err != nil {
+		return nil, err
+	}
+	logStream := &serviceLogStream{
+		service: service.Name,
+		stream:  make(chan runtime.LogRecord),
+		stop:    make(chan bool),
+	}
+	go func() {
+		for {
+			record := runtime.LogRecord{}
+			err := ls.RecvMsg(&record)
+			if err != nil {
+				log.Error(err)
+			}
+			logStream.stream <- record
+		}
+	}()
+	return logStream, nil
+}
+
+type serviceLogStream struct {
+	service string
+	stream  chan runtime.LogRecord
+	sync.Mutex
+	stop chan bool
+	err  error
+}
+
+func (l *serviceLogStream) Error() error {
+	return l.err
+}
+
+func (l *serviceLogStream) Chan() chan runtime.LogRecord {
+	return l.stream
+}
+
+func (l *serviceLogStream) Stop() error {
+	l.Lock()
+	defer l.Unlock()
+	select {
+	case <-l.stop:
+		return nil
+	default:
+		close(l.stop)
+	}
 	return nil
 }
 
@@ -116,8 +161,10 @@ func (s *svc) Update(svc *runtime.Service) error {
 	// runtime service create request
 	req := &pb.UpdateRequest{
 		Service: &pb.Service{
-			Name:    svc.Name,
-			Version: svc.Version,
+			Name:     svc.Name,
+			Version:  svc.Version,
+			Source:   svc.Source,
+			Metadata: svc.Metadata,
 		},
 	}
 
@@ -133,8 +180,10 @@ func (s *svc) Delete(svc *runtime.Service) error {
 	// runtime service create request
 	req := &pb.DeleteRequest{
 		Service: &pb.Service{
-			Name:    svc.Name,
-			Version: svc.Version,
+			Name:     svc.Name,
+			Version:  svc.Version,
+			Source:   svc.Source,
+			Metadata: svc.Metadata,
 		},
 	}
 
@@ -143,28 +192,6 @@ func (s *svc) Delete(svc *runtime.Service) error {
 	}
 
 	return nil
-}
-
-// List lists all services managed by the runtime
-func (s *svc) List() ([]*runtime.Service, error) {
-	// list all services managed by the runtime
-	resp, err := s.runtime.List(context.Background(), &pb.ListRequest{})
-	if err != nil {
-		return nil, err
-	}
-
-	services := make([]*runtime.Service, 0, len(resp.Services))
-	for _, service := range resp.Services {
-		svc := &runtime.Service{
-			Name:     service.Name,
-			Version:  service.Version,
-			Source:   service.Source,
-			Metadata: service.Metadata,
-		}
-		services = append(services, svc)
-	}
-
-	return services, nil
 }
 
 // Start starts the runtime
@@ -182,4 +209,23 @@ func (s *svc) Stop() error {
 // Returns the runtime service implementation
 func (s *svc) String() string {
 	return "service"
+}
+
+// NewRuntime creates new service runtime and returns it
+func NewRuntime(opts ...runtime.Option) runtime.Runtime {
+	// get default options
+	options := runtime.Options{}
+
+	// apply requested options
+	for _, o := range opts {
+		o(&options)
+	}
+
+	// create default client
+	cli := client.DefaultClient
+
+	return &svc{
+		options: options,
+		runtime: pb.NewRuntimeService(runtime.DefaultName, cli),
+	}
 }

@@ -8,20 +8,19 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/micro/cli"
-	"github.com/micro/go-micro"
-	"github.com/micro/go-micro/registry"
-	maddr "github.com/micro/go-micro/util/addr"
-	mhttp "github.com/micro/go-micro/util/http"
-	"github.com/micro/go-micro/util/log"
-	mnet "github.com/micro/go-micro/util/net"
-	mls "github.com/micro/go-micro/util/tls"
+	"github.com/micro/cli/v2"
+	"github.com/micro/go-micro/v2"
+	"github.com/micro/go-micro/v2/logger"
+	"github.com/micro/go-micro/v2/registry"
+	maddr "github.com/micro/go-micro/v2/util/addr"
+	mhttp "github.com/micro/go-micro/v2/util/http"
+	mnet "github.com/micro/go-micro/v2/util/net"
+	mls "github.com/micro/go-micro/v2/util/tls"
 )
 
 type service struct {
@@ -48,35 +47,35 @@ func newService(opts ...Option) Service {
 }
 
 func (s *service) genSrv() *registry.Service {
+	var host string
+	var port string
+	var err error
+
 	// default host:port
-	parts := strings.Split(s.opts.Address, ":")
-	host := strings.Join(parts[:len(parts)-1], ":")
-	port, _ := strconv.Atoi(parts[len(parts)-1])
+	if len(s.opts.Address) > 0 {
+		host, port, err = net.SplitHostPort(s.opts.Address)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
 
 	// check the advertise address first
 	// if it exists then use it, otherwise
 	// use the address
 	if len(s.opts.Advertise) > 0 {
-		parts = strings.Split(s.opts.Advertise, ":")
-
-		// we have host:port
-		if len(parts) > 1 {
-			// set the host
-			host = strings.Join(parts[:len(parts)-1], ":")
-
-			// get the port
-			if aport, _ := strconv.Atoi(parts[len(parts)-1]); aport > 0 {
-				port = aport
-			}
-		} else {
-			host = parts[0]
+		host, port, err = net.SplitHostPort(s.opts.Address)
+		if err != nil {
+			log.Fatal(err)
 		}
 	}
 
 	addr, err := maddr.Extract(host)
 	if err != nil {
-		// best effort localhost
-		addr = "127.0.0.1"
+		log.Fatal(err)
+	}
+
+	if strings.Count(addr, ":") > 0 {
+		addr = "[" + addr + "]"
 	}
 
 	return &registry.Service{
@@ -84,7 +83,7 @@ func (s *service) genSrv() *registry.Service {
 		Version: s.opts.Version,
 		Nodes: []*registry.Node{{
 			Id:       s.opts.Id,
-			Address:  fmt.Sprintf("%s:%d", addr, port),
+			Address:  fmt.Sprintf("%s:%s", addr, port),
 			Metadata: s.opts.Metadata,
 		}},
 	}
@@ -126,7 +125,9 @@ func (s *service) register() error {
 
 	// use RegisterCheck func before register
 	if err := s.opts.RegisterCheck(s.opts.Context); err != nil {
-		log.Logf("Server %s-%s register check error: %s", s.opts.Name, s.opts.Id, err)
+		if logger.V(logger.ErrorLevel, log) {
+			log.Errorf("Server %s-%s register check error: %s", s.opts.Name, s.opts.Id, err)
+		}
 		return err
 	}
 
@@ -152,6 +153,12 @@ func (s *service) start() error {
 
 	if s.running {
 		return nil
+	}
+
+	for _, fn := range s.opts.BeforeStart {
+		if err := fn(); err != nil {
+			return err
+		}
 	}
 
 	l, err := s.listen("tcp", s.opts.Address)
@@ -185,17 +192,13 @@ func (s *service) start() error {
 			if s.static {
 				_, err := os.Stat(static)
 				if err == nil {
-					log.Logf("Enabling static file serving from %s", static)
+					if logger.V(logger.InfoLevel, log) {
+						log.Infof("Enabling static file serving from %s", static)
+					}
 					s.mux.Handle("/", http.FileServer(http.Dir(static)))
 				}
 			}
 		})
-	}
-
-	for _, fn := range s.opts.BeforeStart {
-		if err := fn(); err != nil {
-			return err
-		}
 	}
 
 	var httpSrv *http.Server
@@ -223,7 +226,9 @@ func (s *service) start() error {
 		ch <- l.Close()
 	}()
 
-	log.Logf("Listening on %v", l.Addr().String())
+	if logger.V(logger.DebugLevel, log) {
+		log.Debugf("Listening on %v", l.Addr().String())
+	}
 	return nil
 }
 
@@ -245,7 +250,9 @@ func (s *service) stop() error {
 	s.exit <- ch
 	s.running = false
 
-	log.Log("Stopping")
+	if logger.V(logger.InfoLevel, log) {
+		log.Info("Stopping")
+	}
 
 	for _, fn := range s.opts.AfterStop {
 		if err := fn(); err != nil {
@@ -261,7 +268,7 @@ func (s *service) stop() error {
 
 func (s *service) Client() *http.Client {
 	rt := mhttp.NewRoundTripper(
-		mhttp.WithRegistry(registry.DefaultRegistry),
+		mhttp.WithRegistry(s.opts.Registry),
 	)
 	return &http.Client{
 		Transport: rt,
@@ -327,7 +334,7 @@ func (s *service) Init(opts ...Option) error {
 		serviceOpts = append(serviceOpts, micro.Registry(s.opts.Registry))
 	}
 
-	serviceOpts = append(serviceOpts, micro.Action(func(ctx *cli.Context) {
+	serviceOpts = append(serviceOpts, micro.Action(func(ctx *cli.Context) error {
 		if ttl := ctx.Int("register_ttl"); ttl > 0 {
 			s.opts.RegisterTTL = time.Duration(ttl) * time.Second
 		}
@@ -359,7 +366,13 @@ func (s *service) Init(opts ...Option) error {
 		if s.opts.Action != nil {
 			s.opts.Action(ctx)
 		}
+
+		return nil
 	}))
+
+	// pass in own name and version
+	serviceOpts = append(serviceOpts, micro.Name(s.opts.Name))
+	serviceOpts = append(serviceOpts, micro.Version(s.opts.Version))
 
 	s.opts.Service.Init(serviceOpts...)
 	srv := s.genSrv()
@@ -383,15 +396,21 @@ func (s *service) Run() error {
 	go s.run(ex)
 
 	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT)
+	if s.opts.Signal {
+		signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT)
+	}
 
 	select {
 	// wait on kill signal
 	case sig := <-ch:
-		log.Logf("Received signal %s", sig)
+		if logger.V(logger.InfoLevel, log) {
+			log.Infof("Received signal %s", sig)
+		}
 	// wait on context cancel
 	case <-s.opts.Context.Done():
-		log.Logf("Received context shutdown")
+		if logger.V(logger.InfoLevel, log) {
+			log.Info("Received context shutdown")
+		}
 	}
 
 	// exit reg loop
